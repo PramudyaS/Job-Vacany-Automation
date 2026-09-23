@@ -1,0 +1,995 @@
+Build an MVP Job Vacancy Matching Engine using Laravel.
+
+## Goal
+
+Create an application that automatically collects job vacancies and ranks them based on a manually configured candidate profile.
+
+For the MVP, do NOT implement CV/PDF parsing. Candidate information will be entered manually to keep the system simple and low-cost.
+
+Main flow:
+
+Manual Candidate Profile  
+→ Job Collector  
+→ Job Normalization  
+→ Hard Filtering  
+→ Matching & Scoring  
+→ Ranked Job Vacancy List
+
+---
+
+## Tech Stack
+
+Use:
+
+- PHP 8.3+
+- Laravel 12
+- MySQL or PostgreSQL
+- Redis
+- Laravel Queue
+- Laravel Scheduler
+- Blade
+- Laravel Admin Panel optional, such as Filament
+
+Prefer Laravel-native features before introducing additional dependencies.
+
+Keep the architecture modular so job sources and matching algorithms can be extended later.
+
+---
+
+## 1. Candidate Profile
+
+Create a candidate profile that can store:
+
+- target roles
+- years of experience
+- preferred job levels
+- preferred locations
+- preferred work types
+- minimum expected salary
+- excluded keywords
+- skills
+
+Example:
+
+```json
+{
+  "target_roles": [
+    "Backend Engineer",
+    "PHP Developer",
+    "Software Engineer"
+  ],
+  "experience_years": 4,
+  "preferred_levels": [
+    "mid",
+    "senior"
+  ],
+  "preferred_locations": [
+    "Jakarta",
+    "Remote"
+  ],
+  "work_types": [
+    "remote",
+    "hybrid"
+  ],
+  "minimum_salary": 15000000,
+  "exclude_keywords": [
+    "internship",
+    "frontend only"
+  ]
+}
+```
+
+---
+
+## 2. Candidate Skills
+
+Candidate skills should be stored separately.
+
+Each skill should support a weight.
+
+Example:
+
+```json
+[
+  {
+    "skill": "PHP",
+    "weight": 10
+  },
+  {
+    "skill": "Laravel",
+    "weight": 10
+  },
+  {
+    "skill": "MySQL",
+    "weight": 8
+  },
+  {
+    "skill": "Redis",
+    "weight": 7
+  },
+  {
+    "skill": "Docker",
+    "weight": 6
+  }
+]
+```
+
+Higher weight means the skill is more important when calculating the match score.
+
+---
+
+## 3. Job Sources
+
+Create a generic job source architecture.
+
+Use an interface:
+
+```php
+interface JobSourceInterface
+{
+    public function fetchJobs(): array;
+}
+```
+
+Each provider should implement its own adapter.
+
+Example:
+
+```text
+JobSourceInterface
+├── GlintsJobSource
+├── JobStreetJobSource
+├── CompanyCareerJobSource
+└── MockJobSource
+```
+
+Do not tightly couple the application to a specific provider.
+
+Use dependency injection and Laravel's service container.
+
+For the initial implementation, create at least one mock source so the matching system can be tested without depending on an external website.
+
+Suggested structure:
+
+```text
+app/
+└── Domain/
+    └── Jobs/
+        └── Sources/
+            ├── JobSourceInterface.php
+            ├── MockJobSource.php
+            └── ...
+```
+
+---
+
+## 4. Job Data
+
+Normalized job data should contain:
+
+```text
+id
+job_source_id
+external_id
+
+title
+company_name
+description
+
+location
+work_type
+job_level
+
+salary_min
+salary_max
+
+experience_min
+experience_max
+
+url
+published_at
+
+raw_data
+
+created_at
+updated_at
+```
+
+Store `raw_data` as JSON for debugging and future normalization improvements.
+
+---
+
+## 5. Job Deduplication
+
+Prevent duplicate vacancies.
+
+Use possible identifiers:
+
+```text
+job_source_id + external_id
+normalized URL
+company_name + title + location
+```
+
+Prefer deterministic deduplication.
+
+Add database unique constraints where possible.
+
+Example:
+
+```php
+$table->unique([
+    'job_source_id',
+    'external_id'
+]);
+```
+
+---
+
+## 6. Skill Extraction
+
+Do NOT use an LLM for MVP.
+
+Extract skills from job title and job description using a predefined dictionary.
+
+Example:
+
+```php
+final class SkillAliases
+{
+    public const MAP = [
+        'php' => 'PHP',
+
+        'laravel' => 'Laravel',
+
+        'mysql' => 'MySQL',
+
+        'postgres' => 'PostgreSQL',
+        'postgresql' => 'PostgreSQL',
+
+        'redis' => 'Redis',
+
+        'docker' => 'Docker',
+
+        'k8s' => 'Kubernetes',
+        'kubernetes' => 'Kubernetes',
+
+        'js' => 'JavaScript',
+        'javascript' => 'JavaScript',
+
+        'ts' => 'TypeScript',
+        'typescript' => 'TypeScript',
+    ];
+}
+```
+
+Create a service such as:
+
+```php
+final class SkillExtractor
+{
+    public function extract(string $text): array
+    {
+        //
+    }
+}
+```
+
+Normalize skills before storing them.
+
+Create a separate `job_skills` table.
+
+---
+
+## 7. Hard Filtering
+
+Before calculating match score, reject jobs that clearly do not match the candidate preferences.
+
+Examples:
+
+```text
+Candidate excludes internship
+→ reject internship jobs
+
+Candidate wants remote/hybrid only
+→ reject onsite-only jobs
+
+Salary is explicitly below candidate minimum
+→ reject or mark as failed salary filter
+
+Job requires significantly more experience
+→ reject or heavily penalize
+```
+
+Hard filter logic must be separate from scoring logic.
+
+Suggested structure:
+
+```text
+Job
+↓
+HardFilterEngine
+↓
+Accepted Job
+↓
+MatchingEngine
+```
+
+Example interface:
+
+```php
+interface JobFilterInterface
+{
+    public function passes(
+        CandidateProfile $candidate,
+        Job $job
+    ): bool;
+}
+```
+
+Individual filters can include:
+
+```text
+ExcludedKeywordFilter
+WorkTypeFilter
+SalaryFilter
+ExperienceFilter
+```
+
+---
+
+## 8. Matching Score
+
+Use deterministic scoring.
+
+Initial weights:
+
+```text
+Skill Match          40%
+Role Match           25%
+Experience Match     15%
+Work Type Match      10%
+Location Match        5%
+Salary Match          5%
+```
+
+Formula:
+
+```php
+$totalScore =
+    ($skillScore * 0.40)
+    + ($roleScore * 0.25)
+    + ($experienceScore * 0.15)
+    + ($workTypeScore * 0.10)
+    + ($locationScore * 0.05)
+    + ($salaryScore * 0.05);
+```
+
+Return score between:
+
+```text
+0 - 100
+```
+
+Do not hard-code weights deep inside scoring logic.
+
+Put weights in configuration:
+
+```php
+// config/job_matching.php
+
+return [
+    'weights' => [
+        'skill' => 0.40,
+        'role' => 0.25,
+        'experience' => 0.15,
+        'work_type' => 0.10,
+        'location' => 0.05,
+        'salary' => 0.05,
+    ],
+];
+```
+
+---
+
+## 9. Skill Score
+
+Skill score must consider candidate skill weights.
+
+Example candidate:
+
+```text
+PHP         10
+Laravel     10
+MySQL        8
+Redis        7
+Docker       6
+```
+
+Job:
+
+```text
+PHP
+Laravel
+MySQL
+AWS
+```
+
+Calculate match based on the total candidate skill weights.
+
+Example concept:
+
+```php
+$matchedWeight = 28;
+$totalCandidateWeight = 41;
+
+$skillScore = ($matchedWeight / $totalCandidateWeight) * 100;
+```
+
+Do not treat all candidate skills equally.
+
+Return:
+
+- matched skills
+- unmatched candidate skills
+- job skills not present in candidate profile
+
+---
+
+## 10. Role Matching
+
+Support simple role normalization.
+
+Examples:
+
+```text
+Backend Developer
+Backend Engineer
+PHP Backend Developer
+Laravel Developer
+```
+
+These should have some degree of similarity.
+
+For MVP use:
+
+- normalized strings
+- keyword matching
+- configurable role aliases
+
+Example:
+
+```php
+return [
+    'backend developer' => 'backend engineer',
+    'php backend developer' => 'backend engineer',
+    'laravel backend developer' => 'backend engineer',
+];
+```
+
+Do not use embeddings or LLM.
+
+Create a service:
+
+```php
+final class RoleMatcher
+{
+    public function score(
+        array $candidateRoles,
+        string $jobTitle
+    ): float {
+        //
+    }
+}
+```
+
+---
+
+## 11. Match Result
+
+Store generated matches.
+
+Suggested table:
+
+```text
+job_matches
+
+id
+
+candidate_profile_id
+job_id
+
+total_score
+
+skill_score
+role_score
+experience_score
+work_type_score
+location_score
+salary_score
+
+matched_skills
+missing_skills
+extra_job_skills
+
+status
+
+created_at
+updated_at
+```
+
+Store skill details as JSON initially.
+
+Use a unique constraint:
+
+```text
+candidate_profile_id + job_id
+```
+
+so the same job is not matched multiple times unnecessarily.
+
+---
+
+## 12. Job Status
+
+Support:
+
+```text
+NEW
+SAVED
+INTERESTED
+APPLIED
+IGNORED
+```
+
+Prefer a PHP enum:
+
+```php
+enum JobMatchStatus: string
+{
+    case NEW = 'new';
+    case SAVED = 'saved';
+    case INTERESTED = 'interested';
+    case APPLIED = 'applied';
+    case IGNORED = 'ignored';
+}
+```
+
+Use Laravel enum casting in the Eloquent model.
+
+---
+
+## 13. Job List UI
+
+Create a Blade page that shows vacancies ordered by highest match score.
+
+Example:
+
+```text
+Backend Engineer
+Company A
+
+Match Score: 87%
+
+Matched Skills:
+✓ PHP
+✓ Laravel
+✓ MySQL
+
+Missing Skills:
+- AWS
+
+Experience:
+✓ Candidate: 4 years
+✓ Required: 3–5 years
+
+Work Type:
+✓ Hybrid
+
+Location:
+✓ Jakarta
+```
+
+Filters:
+
+```text
+minimum match score
+status
+work type
+location
+job level
+source
+```
+
+Default sorting:
+
+```text
+total_score DESC
+published_at DESC
+```
+
+Use pagination.
+
+---
+
+## 14. Background Processing
+
+Use Laravel Queue + Redis.
+
+Use Laravel Scheduler to periodically dispatch jobs.
+
+Create queue jobs such as:
+
+```text
+FetchJobVacancies
+NormalizeJobVacancy
+ExtractJobSkills
+CalculateJobMatches
+RefreshExpiredJobs
+```
+
+Flow:
+
+```text
+Laravel Scheduler
+↓
+FetchJobVacancies
+↓
+Deduplicate Jobs
+↓
+Normalize Job Data
+↓
+Extract Skills
+↓
+Hard Filter
+↓
+Calculate Match
+↓
+Store JobMatch
+```
+
+Example scheduling:
+
+```php
+use Illuminate\Support\Facades\Schedule;
+
+Schedule::job(new FetchJobVacancies())
+    ->everyThreeHours();
+```
+
+Do not perform long-running collection or matching directly inside HTTP requests.
+
+---
+
+## 15. Suggested Laravel Structure
+
+Use a modular domain/service architecture.
+
+Example:
+
+```text
+app/
+
+├── Domain/
+│   ├── Candidates/
+│   │   ├── Models/
+│   │   ├── Actions/
+│   │   └── Services/
+│   │
+│   ├── Jobs/
+│   │   ├── Models/
+│   │   ├── Sources/
+│   │   ├── Normalizers/
+│   │   └── Services/
+│   │
+│   └── Matching/
+│       ├── Filters/
+│       ├── Matchers/
+│       ├── Services/
+│       └── DTOs/
+│
+├── Jobs/
+│   ├── FetchJobVacancies.php
+│   ├── ExtractJobSkills.php
+│   └── CalculateJobMatches.php
+│
+├── Http/
+│   ├── Controllers/
+│   └── Requests/
+│
+└── Models/
+```
+
+If using domain models under `Domain`, stay consistent and do not duplicate them under `app/Models`.
+
+---
+
+## 16. Suggested Matching Architecture
+
+Avoid one giant `MatchingService`.
+
+Prefer small components:
+
+```text
+MatchingEngine
+│
+├── SkillMatcher
+├── RoleMatcher
+├── ExperienceMatcher
+├── WorkTypeMatcher
+├── LocationMatcher
+└── SalaryMatcher
+```
+
+Example:
+
+```php
+final class MatchingEngine
+{
+    public function __construct(
+        private SkillMatcher $skillMatcher,
+        private RoleMatcher $roleMatcher,
+        private ExperienceMatcher $experienceMatcher,
+        private WorkTypeMatcher $workTypeMatcher,
+        private LocationMatcher $locationMatcher,
+        private SalaryMatcher $salaryMatcher,
+    ) {}
+
+    public function match(
+        CandidateProfile $candidate,
+        Job $job
+    ): MatchResult {
+        //
+    }
+}
+```
+
+Create a `MatchResult` DTO rather than returning an unstructured array everywhere.
+
+---
+
+## 17. Database Tables
+
+Minimum tables:
+
+```text
+candidate_profiles
+candidate_skills
+
+job_sources
+jobs
+job_skills
+
+job_matches
+```
+
+Potential relationships:
+
+```text
+CandidateProfile
+hasMany CandidateSkill
+hasMany JobMatch
+
+JobSource
+hasMany Job
+
+Job
+belongsTo JobSource
+hasMany JobSkill
+hasMany JobMatch
+```
+
+Indexes should include:
+
+```text
+jobs.external_id
+jobs.job_source_id
+jobs.published_at
+jobs.work_type
+jobs.job_level
+
+job_matches.candidate_profile_id
+job_matches.job_id
+job_matches.total_score
+job_matches.status
+```
+
+---
+
+## 18. MVP Constraints
+
+Do NOT implement yet:
+
+- CV parsing
+- PDF parsing
+- LLM matching
+- AI cover letters
+- automatic job application
+- browser automation
+- embeddings
+- vector database
+- machine learning recommendation
+- interview assistant
+
+Focus only on:
+
+```text
+manual candidate profile
++
+job collection
++
+normalization
++
+keyword extraction
++
+hard filtering
++
+deterministic scoring
++
+job ranking
+```
+
+---
+
+## 19. Development Order
+
+Implement incrementally.
+
+Recommended order:
+
+1. Initialize Laravel project.
+2. Configure database.
+3. Configure Redis and queues.
+4. Create CandidateProfile model and migration.
+5. Create CandidateSkill model and migration.
+6. Create JobSource model and migration.
+7. Create Job model and migration.
+8. Create JobSkill model and migration.
+9. Create JobMatch model and migration.
+10. Add enums.
+11. Implement mock job source.
+12. Implement skill aliases.
+13. Implement SkillExtractor.
+14. Implement hard filters.
+15. Implement individual matching services.
+16. Implement MatchingEngine.
+17. Implement match persistence.
+18. Implement ranked vacancy page.
+19. Implement status updates.
+20. Implement queue jobs.
+21. Implement scheduler.
+22. Add tests.
+
+Do not implement all features in one controller or service.
+
+---
+
+## 20. Testing
+
+Use Pest or PHPUnit.
+
+Prefer Pest if starting a new project.
+
+Create tests for:
+
+```text
+skill normalization
+skill extraction
+weighted skill scoring
+role matching
+experience matching
+work type matching
+location matching
+salary matching
+hard filters
+total match score
+job deduplication
+job match persistence
+```
+
+Example scenario:
+
+```text
+Candidate Skills:
+
+PHP         10
+Laravel     10
+MySQL        8
+Docker       6
+
+Job Skills:
+
+PHP
+Laravel
+MySQL
+AWS
+
+Expected:
+
+Matched:
+PHP
+Laravel
+MySQL
+
+Candidate skill not required:
+Docker
+
+Unknown/missing candidate skill:
+AWS
+
+Skill score must be deterministic.
+```
+
+---
+
+## 21. Important Engineering Principles
+
+Follow these rules:
+
+```text
+Controllers should stay thin.
+
+Do not put business logic inside controllers.
+
+Avoid putting complex matching logic inside Eloquent models.
+
+Use service classes for matching.
+
+Use dedicated filters for hard filtering.
+
+Use interfaces for job sources.
+
+Use DTOs when passing structured matching results.
+
+Use enums instead of magic strings.
+
+Use config files for scoring weights.
+
+Use queues for expensive/background processing.
+
+Make all scoring deterministic and testable.
+```
+
+---
+
+## Final MVP Objective
+
+User flow:
+
+```text
+User configures profile
+↓
+User configures skills and weights
+↓
+
+Laravel Scheduler periodically triggers job collection
+↓
+Job vacancies are normalized
+↓
+Skills are extracted
+↓
+Duplicates are removed
+↓
+Hard filters remove irrelevant jobs
+↓
+MatchingEngine calculates scores
+↓
+JobMatch is stored
+↓
+
+User opens dashboard
+↓
+Highest matching vacancies appear first
+```
+
+The MVP must remain inexpensive to operate and must not require any paid AI API.
+
+Prioritize:
+
+1. simplicity
+2. low operating cost
+3. deterministic results
+4. explainable scoring
+5. testability
+6. modular architecture
+7. easy addition of new job sources
